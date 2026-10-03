@@ -1,1 +1,455 @@
-PLACEHOLDER
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dual screen — one view</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #tag {
+    position: fixed; top: 10px; right: 12px; z-index: 2;
+    font: 12px/1 system-ui, sans-serif; letter-spacing: 0.14em;
+    text-transform: uppercase; color: rgba(214, 224, 236, 0.82);
+    pointer-events: none;
+  }
+  #ui {
+    position: fixed; top: 10px; left: 10px; z-index: 2;
+    font: 13px/1.35 system-ui, sans-serif; color: #d5dce8;
+    max-width: min(440px, calc(100vw - 90px));
+  }
+  button {
+    font: inherit; color: #e8eef8; background: #1c2433;
+    border: 1px solid #3d4d66; border-radius: 6px;
+    padding: 7px 12px; cursor: pointer;
+  }
+  button:hover { background: #263044; }
+  #hint, #note, #fallback {
+    margin: 8px 0 0; color: rgba(210, 220, 235, 0.78); font-size: 12px;
+  }
+  #note:empty { display: none; }
+  #fallback {
+    position: fixed; left: 10px; bottom: 12px; z-index: 2; margin: 0;
+  }
+  #fallback:empty { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="tag"></div>
+<div id="ui" hidden>
+  <button id="open" type="button">Open right side</button>
+  <p id="hint">Hold W or ↑ to drive. A/D or arrows steer. S or ↓ brakes.</p>
+  <p id="note"></p>
+</div>
+<p id="fallback"></p>
+<script>
+(function () {
+  const params = new URLSearchParams(location.search);
+  const side = params.get('side') === 'right' ? 'right' : 'left';
+  const isLeader = side !== 'right';
+  const HFOV = 105 * Math.PI / 180;
+  const LOOK = 0.09;
+  const NEAR = 0.55;
+  const CAM_Y = 1.45;
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const tag = document.getElementById('tag');
+  const ui = document.getElementById('ui');
+  const note = document.getElementById('note');
+  const fallback = document.getElementById('fallback');
+  tag.textContent = isLeader ? 'Left' : 'Right';
+  document.title = (isLeader ? 'Left' : 'Right') + ' — dual view';
+  if (isLeader) ui.hidden = false;
+  if (!isLeader && params.get('fallback') === '1') {
+    fallback.textContent = 'Drag this window to the right monitor and press F11 on both.';
+  }
+
+  let cssW = 1, cssH = 1, focal = 1;
+  const state = { x: 0, z: 0, heading: 0, speed: 0 };
+  const localKeys = { w: 0, a: 0, s: 0, d: 0 };
+  let remoteKeys = { w: 0, a: 0, s: 0, d: 0 };
+  let remoteAt = 0;
+  let rightWin = null;
+  let placeRect = null;
+
+  let channel = null;
+  try { channel = new BroadcastChannel('dual-view'); } catch (e) { channel = null; }
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cssW = Math.max(1, window.innerWidth);
+    cssH = Math.max(1, window.innerHeight);
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    focal = cssW / Math.tan(HFOV * 0.5);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function publish(msg) {
+    if (channel) {
+      try { channel.postMessage(msg); } catch (e) {}
+    }
+    if (isLeader && rightWin && !rightWin.closed) {
+      try { rightWin.postMessage(msg, '*'); } catch (e) {}
+    }
+    if (!isLeader && window.opener && !window.opener.closed) {
+      try { window.opener.postMessage(msg, '*'); } catch (e) {}
+    }
+  }
+
+  function sanitizeKeys(k) {
+    return {
+      w: k && k.w ? 1 : 0,
+      a: k && k.a ? 1 : 0,
+      s: k && k.s ? 1 : 0,
+      d: k && k.d ? 1 : 0
+    };
+  }
+
+  function onData(data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.type === 'state' && !isLeader) {
+      if (typeof data.x !== 'number') return;
+      state.x = data.x;
+      state.z = data.z;
+      state.heading = data.heading;
+      state.speed = data.speed;
+    } else if (data.type === 'keys' && isLeader) {
+      remoteKeys = sanitizeKeys(data.keys);
+      remoteAt = performance.now();
+    } else if (data.type === 'hello' && isLeader) {
+      publish({ type: 'state', x: state.x, z: state.z, heading: state.heading, speed: state.speed });
+    }
+  }
+
+  if (channel) channel.onmessage = function (e) { onData(e.data); };
+  window.addEventListener('message', function (e) { onData(e.data); });
+
+  const CODE = {
+    KeyW: 'w', ArrowUp: 'w',
+    KeyA: 'a', ArrowLeft: 'a',
+    KeyS: 's', ArrowDown: 's',
+    KeyD: 'd', ArrowRight: 'd'
+  };
+
+  function sendKeys() {
+    if (!isLeader) publish({ type: 'keys', keys: sanitizeKeys(localKeys) });
+  }
+
+  window.addEventListener('keydown', function (e) {
+    const name = CODE[e.code];
+    if (!name) return;
+    e.preventDefault();
+    if (localKeys[name]) return;
+    localKeys[name] = 1;
+    sendKeys();
+  });
+  window.addEventListener('keyup', function (e) {
+    const name = CODE[e.code];
+    if (!name) return;
+    e.preventDefault();
+    localKeys[name] = 0;
+    sendKeys();
+  });
+  window.addEventListener('blur', function () {
+    localKeys.w = localKeys.a = localKeys.s = localKeys.d = 0;
+    sendKeys();
+  });
+  if (!isLeader) {
+    setInterval(sendKeys, 150);
+    publish({ type: 'hello' });
+  }
+
+  function step(dt, now) {
+    if (now - remoteAt > 600) remoteKeys = { w: 0, a: 0, s: 0, d: 0 };
+    const throttle = (localKeys.w || remoteKeys.w ? 1 : 0) - (localKeys.s || remoteKeys.s ? 1 : 0);
+    const steer = (localKeys.d || remoteKeys.d ? 1 : 0) - (localKeys.a || remoteKeys.a ? 1 : 0);
+    if (throttle) state.speed += throttle * 22 * dt;
+    else state.speed *= Math.pow(0.35, dt);
+    if (state.speed > 36) state.speed = 36;
+    if (state.speed < -10) state.speed = -10;
+    const grip = Math.abs(state.speed) < 0.35 ? 0.35 : Math.min(1, Math.abs(state.speed) / 12);
+    const dir = state.speed < -0.2 ? -1 : 1;
+    state.heading += steer * 1.45 * grip * dir * dt;
+    state.x += Math.sin(state.heading) * state.speed * dt;
+    state.z += Math.cos(state.heading) * state.speed * dt;
+  }
+
+  function viewOf(wx, wy, wz) {
+    const dx = wx - state.x;
+    const dy = wy - CAM_Y;
+    const dz = wz - state.z;
+    const s = Math.sin(state.heading);
+    const c = Math.cos(state.heading);
+    const x = dx * c - dz * s;
+    const zf = dx * s + dz * c;
+    const cl = Math.cos(LOOK);
+    const sl = Math.sin(LOOK);
+    return { x: x, y: dy * cl + zf * sl, z: -dy * sl + zf * cl };
+  }
+
+  function clipNear(pts) {
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+      const aIn = a.z >= NEAR;
+      const bIn = b.z >= NEAR;
+      if (aIn && bIn) out.push(b);
+      else if (aIn !== bIn) {
+        const dz = b.z - a.z;
+        const t = Math.abs(dz) < 1e-6 ? 0 : (NEAR - a.z) / dz;
+        out.push({
+          x: a.x + (b.x - a.x) * t,
+          y: a.y + (b.y - a.y) * t,
+          z: NEAR
+        });
+        if (bIn) out.push(b);
+      }
+    }
+    return out;
+  }
+
+  function project(p) {
+    const sx = focal * (p.x / p.z);
+    const sy = focal * (p.y / p.z);
+    return [side === 'left' ? sx + cssW : sx, cssH * 0.5 - sy];
+  }
+
+  function fog(rgb, z) {
+    const t = Math.min(1, Math.max(0, (z - 24) / 170));
+    const k = t * t;
+    const fr = 10, fg = 14, fb = 24;
+    const r = (rgb[0] + (fr - rgb[0]) * k) | 0;
+    const g = (rgb[1] + (fg - rgb[1]) * k) | 0;
+    const b = (rgb[2] + (fb - rgb[2]) * k) | 0;
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  const batch = [];
+  function addQuad(world, rgb, bias) {
+    const view = [];
+    let depth = 0;
+    for (let i = 0; i < world.length; i++) {
+      const p = viewOf(world[i][0], world[i][1], world[i][2]);
+      view.push(p);
+      depth += p.z;
+    }
+    depth = depth / view.length + (bias || 0);
+    if (depth > 280) return;
+    batch.push({ view: view, rgb: rgb, depth: depth });
+  }
+
+  function hash(n) {
+    const x = Math.sin(n * 127.1) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  function building(x, z, w, d, h, rgb) {
+    const x0 = x - w / 2, x1 = x + w / 2, z0 = z - d / 2, z1 = z + d / 2;
+    const wall = rgb;
+    const sideC = [rgb[0] * 0.72 | 0, rgb[1] * 0.72 | 0, rgb[2] * 0.72 | 0];
+    const roof = [rgb[0] * 0.55 | 0, rgb[1] * 0.55 | 0, rgb[2] * 0.6 | 0];
+    addQuad([[x0, 0, z0], [x1, 0, z0], [x1, h, z0], [x0, h, z0]], wall, 0);
+    addQuad([[x1, 0, z1], [x0, 0, z1], [x0, h, z1], [x1, h, z1]], wall, 0);
+    addQuad([[x0, 0, z1], [x0, 0, z0], [x0, h, z0], [x0, h, z1]], sideC, 0);
+    addQuad([[x1, 0, z0], [x1, 0, z1], [x1, h, z1], [x1, h, z0]], sideC, 0);
+    addQuad([[x0, h, z0], [x1, h, z0], [x1, h, z1], [x0, h, z1]], roof, 0);
+  }
+
+  function paintSky() {
+    const horizon = cssH * 0.5 - focal * Math.tan(LOOK);
+    const g = ctx.createLinearGradient(0, 0, 0, cssH);
+    g.addColorStop(0, '#070b14');
+    const t = horizon / cssH;
+    if (t > 0.04 && t < 0.92) {
+      g.addColorStop(t, '#2a3b58');
+      g.addColorStop(Math.min(0.98, t + 0.03), '#171910');
+    }
+    g.addColorStop(1, '#10120e');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, cssW, cssH);
+  }
+
+  function drawWorld() {
+    batch.length = 0;
+    const seg = 8;
+    const zStart = Math.floor((state.z - 50) / seg) * seg;
+    for (let z = zStart; z < state.z + 210; z += seg) {
+      addQuad([[-48, 0, z], [-9, 0, z], [-9, 0, z + seg], [-48, 0, z + seg]], [18, 22, 18], 10);
+      addQuad([[9, 0, z], [48, 0, z], [48, 0, z + seg], [9, 0, z + seg]], [18, 22, 18], 10);
+      addQuad([[-9, 0, z], [-4, 0, z], [-4, 0, z + seg], [-9, 0, z + seg]], [32, 34, 30], 8);
+      addQuad([[4, 0, z], [9, 0, z], [9, 0, z + seg], [4, 0, z + seg]], [32, 34, 30], 8);
+      addQuad([[-4, 0, z], [4, 0, z], [4, 0, z + seg], [-4, 0, z + seg]], [26, 28, 34], 8);
+      addQuad([[-4.18, 0.02, z], [-3.88, 0.02, z], [-3.88, 0.02, z + seg], [-4.18, 0.02, z + seg]], [196, 168, 64], 4);
+      addQuad([[3.88, 0.02, z], [4.18, 0.02, z], [4.18, 0.02, z + seg], [3.88, 0.02, z + seg]], [196, 168, 64], 4);
+    }
+    const period = 9;
+    const i0 = Math.floor((state.z - 50) / period);
+    const i1 = Math.floor((state.z + 210) / period);
+    for (let i = i0; i <= i1; i++) {
+      const z = i * period;
+      addQuad([[-0.14, 0.03, z], [0.14, 0.03, z], [0.14, 0.03, z + 4], [-0.14, 0.03, z + 4]], [226, 224, 210], 4);
+    }
+    const pStep = 16;
+    const p0 = Math.floor((state.z - 40) / pStep) * pStep;
+    for (let z = p0; z < state.z + 180; z += pStep) {
+      building(-5.15, z, 0.16, 0.16, 1.05, [170, 168, 150]);
+      building(5.15, z, 0.16, 0.16, 1.05, [170, 168, 150]);
+    }
+    const bStep = 20;
+    const b0 = Math.floor((state.z - 40) / bStep);
+    const b1 = Math.floor((state.z + 200) / bStep);
+    for (let i = b0; i <= b1; i++) {
+      for (let s = 0; s < 2; s++) {
+        const sideSign = s === 0 ? -1 : 1;
+        const n = i * 13 + sideSign * 5;
+        const bw = 5 + hash(n) * 3.5;
+        const bd = 6 + hash(n + 2) * 5;
+        const bh = 4 + hash(n + 4) * 16;
+        const inset = 7 + hash(n + 6) * 5;
+        const x = sideSign * (4.2 + inset + bw / 2);
+        const z = i * bStep + (hash(n + 8) - 0.5) * 6;
+        const shade = 46 + ((hash(n + 1) * 50) | 0);
+        const rgb = sideSign < 0
+          ? [shade, shade + 6, shade + 16]
+          : [shade + 8, shade + 4, shade - 4];
+        building(x, z, bw, bd, bh, rgb);
+      }
+    }
+    batch.sort(function (a, b) { return b.depth - a.depth; });
+    for (let i = 0; i < batch.length; i++) {
+      const item = batch[i];
+      const clipped = clipNear(item.view);
+      if (clipped.length < 3) continue;
+      const pts = [];
+      let minX = Infinity, maxX = -Infinity, zSum = 0, ok = true;
+      for (let j = 0; j < clipped.length; j++) {
+        const p = clipped[j];
+        if (!(p.z > 0)) { ok = false; break; }
+        const s = project(p);
+        if (!isFinite(s[0]) || !isFinite(s[1])) { ok = false; break; }
+        pts.push(s);
+        if (s[0] < minX) minX = s[0];
+        if (s[0] > maxX) maxX = s[0];
+        zSum += p.z;
+      }
+      if (!ok || maxX < -80 || minX > cssW + 80) continue;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let j = 1; j < pts.length; j++) ctx.lineTo(pts[j][0], pts[j][1]);
+      ctx.closePath();
+      ctx.fillStyle = fog(item.rgb, zSum / clipped.length);
+      ctx.fill();
+    }
+  }
+
+  function drawHood() {
+    const yb = cssH + 30;
+    const yt = cssH - Math.min(96, cssH * 0.14);
+    const halfTop = cssW * 0.1;
+    const poly = [[-cssW * 1.4, yb], [cssW * 1.4, yb], [halfTop, yt], [-halfTop, yt]];
+    ctx.beginPath();
+    for (let i = 0; i < poly.length; i++) {
+      const x = side === 'left' ? poly[i][0] + cssW : poly[i][0];
+      if (i === 0) ctx.moveTo(x, poly[i][1]);
+      else ctx.lineTo(x, poly[i][1]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = '#12141c';
+    ctx.fill();
+    const x1 = side === 'left' ? -halfTop + cssW : -halfTop;
+    const x2 = side === 'left' ? halfTop + cssW : halfTop;
+    ctx.beginPath();
+    ctx.moveTo(x1, yt);
+    ctx.lineTo(x2, yt);
+    ctx.strokeStyle = 'rgba(190, 210, 230, 0.4)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  function render() {
+    paintSky();
+    drawWorld();
+    drawHood();
+  }
+
+  document.getElementById('open').addEventListener('click', async function () {
+    const url = new URL(location.href);
+    url.searchParams.set('side', 'right');
+    url.searchParams.delete('fallback');
+    let placed = false;
+    placeRect = null;
+    let features = 'popup=yes,resizable=yes,width=960,height=700';
+    if (typeof window.getScreenDetails === 'function') {
+      try {
+        const details = await window.getScreenDetails();
+        const here = details.currentScreen;
+        let other = null;
+        for (let i = 0; i < details.screens.length; i++) {
+          const s = details.screens[i];
+          if (s !== here) { other = s; break; }
+        }
+        if (other) {
+          const left = other.availLeft != null ? other.availLeft : other.left;
+          const top = other.availTop != null ? other.availTop : other.top;
+          const width = other.availWidth || other.width;
+          const height = other.availHeight || other.height;
+          if (width && height && (left !== here.availLeft || top !== here.availTop || details.screens.length > 1)) {
+            placeRect = {
+              left: Math.round(left),
+              top: Math.round(top),
+              width: Math.round(width),
+              height: Math.round(height)
+            };
+            features = 'popup=yes,resizable=yes,left=' + placeRect.left +
+              ',top=' + placeRect.top + ',width=' + placeRect.width + ',height=' + placeRect.height;
+            placed = true;
+          }
+        }
+      } catch (e) {
+        placed = false;
+      }
+    }
+    if (!placed) url.searchParams.set('fallback', '1');
+    rightWin = window.open(url.toString(), 'dual-view-right', features);
+    if (!rightWin) {
+      note.textContent = 'Pop-up blocked. Allow pop-ups, then click Open right side again.';
+      return;
+    }
+    if (placed && placeRect) {
+      note.textContent = '';
+      const rect = placeRect;
+      setTimeout(function () {
+        try {
+          if (rightWin && !rightWin.closed) {
+            rightWin.moveTo(rect.left, rect.top);
+            rightWin.resizeTo(rect.width, rect.height);
+          }
+        } catch (e) {}
+      }, 60);
+    } else {
+      note.textContent = 'Drag the new window to the right monitor and press F11 on both.';
+    }
+  });
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (isLeader) {
+      step(dt, now);
+      publish({ type: 'state', x: state.x, z: state.z, heading: state.heading, speed: state.speed });
+    }
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
